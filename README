@@ -1,0 +1,137 @@
+Android 增加物理按键
+(以CAMERA键为例)
+
+
+1.INPUT子系统的流程
+
+    Event设备      ==>       KEY(int)        ==>           KEY(string)       ==>        AKEYCODE(int)
+	             input事件上报          按键布局转换(kl配置文件)            KeycodeLabels转换
+
+
+
+2.linux kernel键值上报
+linux-3.10/arch/arm/plat-lc/drivers/keypad/comip-keypad-gpio.c
+
+static void gpio_keys_report_event(struct gpio_button_data *bdata){
+    ...
+    if (type == EV_ABS) {
+        if (state) {
+            input_event(input, type, button->code, button->value);
+            printk(KERN_DEBUG "key %d reported, value = %d\n", button->code, button->value);
+        }
+    } else {
+        input_event(input, type, button->code, !!state);
+        printk(KERN_DEBUG "key %d reported\n", button->code);
+
+        if (state)
+            bdata->tm_start = jiffies;
+        else
+	    elapse = jiffies - bdata->tm_start;
+        if ((elapse >= GPIO_KEYS_LONG_PRESS_MIN) && (elapse <= GPIO_KEYS_LONG_PRESS_MAX))
+        #ifdef BUILD_MASS_PRODUCTION
+	    printk("key %d reported. elapse %ld\n", button->code, elapse);
+        #else
+	    panic("key %d reported. elapse %ld\n", button->code, elapse);
+        #endif
+    }
+    input_sync(input);
+    ...
+}
+
+由此看出, kernel通过调用input_event()将按键值 button->code 上报系统user space, button->code 对应值位于
+linux-3.10/include/uapi/linux/input.h文件中
+
+
+3.按键映射
+终端输入命令 cat /proc/bus/input/devices
+shell@fourmode:/ # cat /proc/bus/input/devices                                 
+I: Bus=0019 Vendor=0001 Product=0001 Version=0100
+N: Name="comip-gpio-keys"
+P: Phys=gpio-keys/input0
+S: Sysfs=/devices/platform/comip-gpio-keys/input/input0
+U: Uniq=
+H: Handlers=kbd event0 
+B: PROP=0
+B: EV=3
+B: KEY=100000 0 0 40000 0 0 0
+...
+通过log可以看出, 设备使用的comip-gpio-keys.kl映射文件, 该文件位于源码 device/leadcore/fourmode/comip-gpio-keys.kl
+编译生成文件位于 out/target/product/fourmode/system/usr/keylayout/comip-gpio-keys.kl, 内容为:
+key 107   ENDCALL           WAKE_DROPPED
+key 113   MUTE
+key 114   VOLUME_DOWN
+key 115   VOLUME_UP
+key 163   MEDIA_NEXT
+key 164   MEDIA_PLAY_PAUSE
+key 165   MEDIA_PREVIOUS
+key 226   HEADSETHOOK       WAKE
+key 231   CALL              WAKE_DROPPED
+key 102   HOME		    WAKE
+key 212   CAMERA
+
+说明:
+key         关键字,不需要改动
+212         kernel中上报的键值,参考include/uapi/linux/input.h
+CAMERA      按键映射的字符串,它对应的是 KeycodeLabels.h 中 { "CAMERA", 27 },
+KeycodeLabels.h文件位于 frameworks/native/include/input/KeycodeLabels.h
+
+
+4.Framework层修改
+a.如果键值已存在,无需改动; 如果定义了新的按键, 需要在frameworks/native/include/android/keycodes.h添加新按键
+enum{
+    ...
+    AKEYCODE_CAMERA          = 27,
+    ...
+};
+
+接着修改frameworks/base/core/res/res/values/attrs.xml文件中
+    <attr name="keycode">
+        ...
+        <enum name="KEYCODE_CAMERA" value="27" />
+        ...
+    <\attr>
+
+frameworks/base/core/java/android/view/KeyEvent.java文件中
+public class KeyEvent extends InputEvent implements Parcelable {
+    ...
+    public static final int KEYCODE_CAMERA       = 27;
+    ...
+}
+
+b.按键捕获
+可以在frameworks/base/policy/src/com/android/internal/policy/impl/PhoneWindowManager.java(位置可能不同)文件,
+public long interceptKeyBeforeDispatching方法中捕获该键值, 也可以自定义捕获的地方, 用来做什么取决于功能需求.
+通过adb调试, 使用logcat命令, 发现CAMERA按键已经被PhoneWindowManager类捕获：
+D/WindowManager(  777): interceptKeyTq keycode=27 screenIsOn=true keyguardActive=false policyFlags=2000000 isWakeKey=false
+D/WindowManager(  777): interceptKeyTi keyCode=27 down=true repeatCount=0 keyguardOn=false mHomePressed=false canceled=false
+经过代码追踪, 确定第一条log在interceptKeyBeforeQueueing方法中打印, 第二条log在interceptKeyBeforeDispatching方法中打印,说明CAMERA按键
+可以被正常捕获, 只是未对KEYCODE_CAMERA未作处理.
+
+
+5.功能设计
+本次要实现的是在Lanucher中长按CAMERA按键启动相机.Lancher2继承于Activity类, 因此可以通过重写onKeyDown()方法捕获CAMERA按键：
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        ...
+        /* test by raibo meng, 01-12-2018 */
+        if (keyCode == KeyEvent.KEYCODE_CAMERA && event.isLongPress()) {
+            //Log.d(TAG, "\nKEYCODE_CAMERA is Long Press\n\n");
+            Intent intent = new Intent();
+            intent.setAction("android.media.action.STILL_IMAGE_CAMERA"); // 设置Intent Action属性, 调用相机
+            startActivity(intent); // 启动Activity
+            // start app by packagename
+            //startAPP("com.android.camera2");
+        }
+        /* end */
+        ...
+    }
+
+除了通过MediaStore类启动Camera外, 还可以通过包名启动app:
+    public void startAPP(String appPackageName){
+        try{
+            Intent intent = this.getPackageManager().getLaunchIntentForPackage(appPackageName);
+            startActivity(intent);
+        }catch(Exception e){
+            Toast.makeText(this, "app package name error or app has not install", Toast.LENGTH_LONG).show();
+        }
+    }
+
